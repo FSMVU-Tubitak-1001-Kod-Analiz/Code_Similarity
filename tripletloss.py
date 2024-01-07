@@ -1,135 +1,117 @@
-from transformers import AutoTokenizer, AutoModel
-import torch
-from scipy.spatial.distance import cosine
-import os
-import numpy as np
-import random
+# Gerekli Kütüphaneler
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Dense, Dropout, BatchNormalization, concatenate
-from tensorflow.keras.models import Model
-import tensorflow.keras.backend as K
+from transformers import TFAutoModel, AutoTokenizer
+import os
 
-# Load tokenizer and model from Hugging Face's Transformers for code embeddings
+# CodeBERT Tokenizer ve Modelini Yükle
 tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-codebert_model = AutoModel.from_pretrained("microsoft/codebert-base")
+codebert_model = TFAutoModel.from_pretrained("microsoft/codebert-base")
 
-# Define directory and get list of Java files
-extracted_dir = r'C:\Users\ATABDELLATIF\Documents\GitHub\DATASETS\Demo'
-all_files = [os.path.join(extracted_dir, f) for f in os.listdir(extracted_dir) if f.endswith('.java')]
-
-# Function to get CodeBERT embeddings for a file
-def get_embedding_for_file(file_path):
+# Kodu tokenize etme fonksiyonu
+def tokenize_code(file_path, tokenizer):
     with open(file_path, 'r', encoding='utf-8') as file:
         code = file.read()
-    inputs = tokenizer(code, return_tensors="pt", padding=True, truncation=True)
-    outputs = codebert_model(**inputs)
-    return outputs.pooler_output.detach().numpy()  # Convert tensor to numpy for compatibility
+    inputs = tokenizer(code, return_tensors="tf", truncation=True, padding='max_length', max_length=512)
+    return inputs['input_ids'], inputs['attention_mask']
 
-# Compute embeddings for all files
-embeddings = {file: get_embedding_for_file(file) for file in all_files}
-#ref: https://github.com/FSMVU-Tubitak-1001-Kod-Analiz/Triplet-net-keras/blob/triplet-for-sourcecode/Triplet%20NN%20Test%20on%20MNIST.ipynb
-# Function to find positive (similar) and negative (dissimilar) examples for an anchor
-def find_positive_negative_Tripletloss(anchor_embedding, embeddings, all_files):
-    # Calculate cosine distances between anchor and all other embeddings
-    distances = {file: cosine(anchor_embedding, embeddings[file]) for file in all_files}
-    # Sort files based on distance to find the most similar and dissimilar ones
-    sorted_distances = sorted(distances.items(), key=lambda x: x[1])
-    positive = sorted_distances[1][0]  # Closest file
-    negative_candidates = sorted_distances[len(sorted_distances)//2:]  # Distant half as candidates for negative
-    negative = random.choice(negative_candidates)[0]  
-    return positive, negative
-def find_positive_negative_knn(anchor_embedding, embeddings):
-    # Convert embeddings to a list of vectors for NearestNeighbors
-    embedding_list = list(embeddings.values())
-    file_list = list(embeddings.keys())
-    
-    # Fit the NearestNeighbors model
-    neigh = NearestNeighbors(n_neighbors=len(embedding_list), metric='cosine')
-    neigh.fit(embedding_list)
-    
-    # Find the nearest neighbors for the anchor embedding
-    distances, indices = neigh.kneighbors([anchor_embedding], n_neighbors=len(embedding_list))
-    
-    # Find the positive and negative examples (excluding the anchor itself which is at index 0)
-    positive_index = indices[0][1]  # The closest neighbor (index 1)
-    negative_index = indices[0][-1]  # The furthest neighbor
-    positive = file_list[positive_index]
-    negative = file_list[negative_index]
-    
-    return positive, negative
+# Dosyaları işleyip tokenize etme fonksiyonu
+def load_and_tokenize_data(file_paths, tokenizer):
+    input_ids_list = []
+    attention_masks_list = []
+    for path in file_paths:
+        input_ids, attention_mask = tokenize_code(path, tokenizer)
+        input_ids_list.append(tf.squeeze(input_ids))
+        attention_masks_list.append(tf.squeeze(attention_mask))
+    return input_ids_list, attention_masks_list
 
-# Generate triplets using k-NN
-triplets = []
-for anchor_file in all_files:
-    anchor_embedding = embeddings[anchor_file]
-    positive, negative = find_positive_negative_knn(anchor_embedding, embeddings)
-    triplets.append((anchor_file, positive, negative))
+# Gömme Modelini Tanımla
+def codebert_embedding_model():
+    input_ids = tf.keras.layers.Input(shape=(512,), dtype='int32')
+    attention_mask = tf.keras.layers.Input(shape=(512,), dtype='int32')
+    embeddings = codebert_model(input_ids, attention_mask=attention_mask)[0][:,0,:]
+    return tf.keras.Model(inputs=[input_ids, attention_mask], outputs=embeddings)
 
-# Print out the triplets
-for triplet in triplets:
-    print(triplet)
-# Generate triplets (anchor, positive, negative)
-triplets = []
-for anchor_file in all_files:
-    anchor_embedding = embeddings[anchor_file]
-    positive, negative = find_positive_negative_Tripletloss(anchor_embedding, embeddings, all_files)
-    triplets.append((anchor_file, positive, negative))
+embedding_model = codebert_embedding_model()
 
-# Define triplet loss function
-def triplet_loss(alpha=0.4):
-    # Custom loss for training
-    def loss(y_true, y_pred):
-        # Split the predictions into anchor, positive, and negative parts
-        total_length = y_pred.shape.as_list()[-1]
-        anchor = y_pred[:, 0:int(total_length*1/3)]
-        positive = y_pred[:, int(total_length*1/3):int(total_length*2/3)]
-        negative = y_pred[:, int(total_length*2/3):int(total_length*3/3)]
-        # Calculate squared distances
-        pos_dist = K.sum(K.square(anchor - positive), axis=1)
-        neg_dist = K.sum(K.square(anchor - negative), axis=1)
-        # Compute triplet loss
-        basic_loss = pos_dist - neg_dist + alpha
-        return K.maximum(basic_loss, 0.0)
+# Triplet Loss Fonksiyonu
+
+'''
+Bu fonksiyon, modelin anchor ile positive arasındaki mesafeyi azaltıp,
+ anchor ile negative arasındaki mesafeyi artırmasını sağlayacak şekilde kaybı (loss) hesaplar.
+'''
+def triplet_loss(y_true, y_pred, alpha=0.2):
+    anchor, positive, negative = y_pred[0], y_pred[1], y_pred[2]
+    pos_dist = tf.reduce_sum(tf.square(anchor - positive), axis=-1)  # Anchor ile Positive arasındaki mesafe
+    neg_dist = tf.reduce_sum(tf.square(anchor - negative), axis=-1)  # Anchor ile Negative arasındaki mesafe
+    basic_loss = pos_dist - neg_dist + alpha  # Loss hesaplama
+    loss = tf.reduce_mean(tf.maximum(basic_loss, 0.0))  # Loss'un sıfırdan büyük olmasını sağlama
     return loss
 
-# Create shared network for processing embeddings
-def create_shared_network(input_shape):
-    # Define a neural network to process the input embeddings
-    input = Input(shape=input_shape)
-    x = Dense(256, activation='relu')(input)
-    x = BatchNormalization()(x)
-    x = Dropout(0.5)(x)
-    x = Dense(128, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    x = Dense(64, activation='relu')(x)
-    x = BatchNormalization()(x)
-    return Model(inputs=[input], outputs=[x])
 
-# Prepare input tensors for training
-input_shape = (768,)  # Shape of CodeBERT embeddings
-shared_network = create_shared_network(input_shape)
+# Veri setlerini yükle ve tokenize et
+anchor_input_ids, anchor_attention_masks = load_and_tokenize_data(anchor_array, tokenizer)
+positive_input_ids, positive_attention_masks = load_and_tokenize_data(positive_array, tokenizer)
+negative_input_ids, negative_attention_masks = load_and_tokenize_data(negative_array, tokenizer)
 
-# Reshape embeddings and create arrays for training
-anchor_embeddings = np.array([embeddings[triplet[0]].reshape(-1) for triplet in triplets])
-positive_embeddings = np.array([embeddings[triplet[1]].reshape(-1) for triplet in triplets])
-negative_embeddings = np.array([embeddings[triplet[2]].reshape(-1) for triplet in triplets])
+# Veri setini oluştur
+def create_dataset(input_ids, attention_masks):
+    return tf.data.Dataset.from_tensor_slices((input_ids, attention_masks))
 
-# Define the model with triplet architecture
-anchor_input = Input(shape=input_shape, name='anchor_input')
-positive_input = Input(shape=input_shape, name='positive_input')
-negative_input = Input(shape=input_shape, name='negative_input')
+anchor_dataset = create_dataset(anchor_input_ids, anchor_attention_masks)
+positive_dataset = create_dataset(positive_input_ids, positive_attention_masks)
+negative_dataset = create_dataset(negative_input_ids, negative_attention_masks)
 
-# Process each input through the shared network
-encoded_anchor = shared_network(anchor_input)
-encoded_positive = shared_network(positive_input)
-encoded_negative = shared_network(negative_input)
+triplet_dataset = tf.data.Dataset.zip((anchor_dataset, positive_dataset, negative_dataset))
+batch_size = 32  # Batch boyutunu ayarla
+triplet_dataset = triplet_dataset.batch(batch_size)
 
-# Concatenate the outputs for the final model
-merged_vector = concatenate([encoded_anchor, encoded_positive, encoded_negative], axis=-1, name='merged_layer')
-model = Model(inputs=[anchor_input, positive_input, negative_input], outputs=merged_vector)
+# Eğitim döngüsü
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
+# Toplam eğitim epoch sayısını ayarla
+num_epochs = 10
 
-# Compile and train the model
-model.compile(loss=triplet_loss(alpha=0.4), optimizer='adam')
-y_dummy = np.empty((anchor_embeddings.shape[0],))  # Dummy labels for training
-model.fit([anchor_embeddings, positive_embeddings, negative_embeddings], y_dummy, epochs=10, batch_size=32)
+
+
+
+'''
+Yukarıda verilen kod, bir Triplet Loss modelinin eğitimini ve modelin bir dosya olarak saklanmasını sağlar.
+Eğitim sürecinde, model "code_similarity_model" adı altında yerel diskte kaydedilir.
+Bu, modelin eğitim sonrası durumunu içerir ve bu modeli daha sonra kullanmak için bu dosyayı yükleyebilirsiniz.
+
+'''
+# Eğitim epoch'ları için döngü
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch+1} başlıyor")  # Mevcut epoch'un başladığını bildir
+    epoch_loss = 0  # Bu epoch için toplam kaybı sıfırla
+
+    # Dataset üzerinden döngü yaparak her bir triplet için eğitim gerçekleştir
+    for step, ((anchor_input, anchor_mask), (positive_input, positive_mask), (negative_input, negative_mask)) in enumerate(triplet_dataset):
+
+        '''
+        tf.GradientTape kullanımının nedeni, TensorFlow'da otomatik türev hesaplama işlevini sağlamasıdır.
+        Derin öğrenme modelleri genellikle geri yayılım (backpropagation) yoluyla eğitilir,
+        bu süreçte modelin ağırlıkları, kayıp fonksiyonunun (loss function) gradyanlarına göre güncellenir.
+         tf.GradientTape bu gradyan hesaplamalarını kolaylaştırır.
+        '''
+        with tf.GradientTape() as tape:
+            # Embedding modelini kullanarak anchor, positive ve negative için embedding'leri hesapla
+            anchor_embeddings = embedding_model([anchor_input, anchor_mask])
+            positive_embeddings = embedding_model([positive_input, positive_mask])
+            negative_embeddings = embedding_model([negative_input, negative_mask])
+
+            # Triplet kaybını hesapla
+            loss = triplet_loss(None, [anchor_embeddings, positive_embeddings, negative_embeddings])
+
+        # Hesaplanan kayıp üzerinden gradyanları hesapla
+        gradients = tape.gradient(loss, embedding_model.trainable_variables)
+        # Optimizer kullanarak gradyanları uygula ve model ağırlıklarını güncelle
+        optimizer.apply_gradients(zip(gradients, embedding_model.trainable_variables))
+        # Epoch kaybına bu adımdaki kaybı ekle
+        epoch_loss += loss.numpy()
+
+    # Epoch sonunda toplam kaybı yazdır
+    print(f"Epoch {epoch+1} Kaybı: {epoch_loss}")
+
+
+# Modeli kaydet
+embedding_model.save("code_similarity_model")
