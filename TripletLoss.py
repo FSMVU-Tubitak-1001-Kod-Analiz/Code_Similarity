@@ -1,37 +1,22 @@
-# Gerekli Kütüphaneler
+
 import tensorflow as tf
 from transformers import TFAutoModel, AutoTokenizer
-import os
 
-# CodeBERT Tokenizer ve Modelini Yükle
-tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+# Load CodeBERT Model
 codebert_model = TFAutoModel.from_pretrained("microsoft/codebert-base")
 
-# Kodu tokenize etme fonksiyonu
-def tokenize_code(file_path, tokenizer):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        code = file.read()
-    inputs = tokenizer(code, return_tensors="tf", truncation=True, padding='max_length', max_length=512)
-    return inputs['input_ids'], inputs['attention_mask']
-
-# Dosyaları işleyip tokenize etme fonksiyonu
-def load_and_tokenize_data(file_paths, tokenizer):
-    input_ids_list = []
-    attention_masks_list = []
-    for path in file_paths:
-        input_ids, attention_mask = tokenize_code(path, tokenizer)
-        input_ids_list.append(tf.squeeze(input_ids))
-        attention_masks_list.append(tf.squeeze(attention_mask))
-    return input_ids_list, attention_masks_list
-
-# Gömme Modelini Tanımla
+# Rebuild the embedding model architecture (matching the saved model)
 def codebert_embedding_model():
     input_ids = tf.keras.layers.Input(shape=(512,), dtype='int32')
     attention_mask = tf.keras.layers.Input(shape=(512,), dtype='int32')
     embeddings = codebert_model(input_ids, attention_mask=attention_mask)[0][:,0,:]
     return tf.keras.Model(inputs=[input_ids, attention_mask], outputs=embeddings)
 
+# Instantiate the model
 embedding_model = codebert_embedding_model()
+
+# Load the weights from the saved model
+loaded_model = tf.keras.models.load_model("Code_Similarity/Code_Similarity/code_similarity_model")
 
 # Triplet Loss Fonksiyonu
 
@@ -70,15 +55,6 @@ optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
 # Toplam eğitim epoch sayısını ayarla
 num_epochs = 10
 
-
-
-
-'''
-Yukarıda verilen kod, bir Triplet Loss modelinin eğitimini ve modelin bir dosya olarak saklanmasını sağlar.
-Eğitim sürecinde, model "code_similarity_model" adı altında yerel diskte kaydedilir.
-Bu, modelin eğitim sonrası durumunu içerir ve bu modeli daha sonra kullanmak için bu dosyayı yükleyebilirsiniz.
-
-'''
 # Eğitim epoch'ları için döngü
 for epoch in range(num_epochs):
     print(f"Epoch {epoch+1} başlıyor")  # Mevcut epoch'un başladığını bildir
@@ -87,12 +63,6 @@ for epoch in range(num_epochs):
     # Dataset üzerinden döngü yaparak her bir triplet için eğitim gerçekleştir
     for step, ((anchor_input, anchor_mask), (positive_input, positive_mask), (negative_input, negative_mask)) in enumerate(triplet_dataset):
 
-        '''
-        tf.GradientTape kullanımının nedeni, TensorFlow'da otomatik türev hesaplama işlevini sağlamasıdır.
-        Derin öğrenme modelleri genellikle geri yayılım (backpropagation) yoluyla eğitilir,
-        bu süreçte modelin ağırlıkları, kayıp fonksiyonunun (loss function) gradyanlarına göre güncellenir.
-         tf.GradientTape bu gradyan hesaplamalarını kolaylaştırır.
-        '''
         with tf.GradientTape() as tape:
             # Embedding modelini kullanarak anchor, positive ve negative için embedding'leri hesapla
             anchor_embeddings = embedding_model([anchor_input, anchor_mask])
@@ -114,4 +84,4 @@ for epoch in range(num_epochs):
 
 
 # Modeli kaydet
-embedding_model.save("code_similarity_model")
+embedding_model.save("new_code_similarity_model")
